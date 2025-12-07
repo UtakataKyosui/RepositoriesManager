@@ -52,10 +52,14 @@ enum AppMode {
         field: EditField,
         content: String,
     },
+    Searching {
+        query: String,
+    },
 }
 
 struct App {
     repositories: Vec<Repository>,
+    filtered_indices: Vec<usize>, // Indices of repositories matching search
     table_state: TableState,
     mode: AppMode,
     status_message: String,
@@ -63,22 +67,27 @@ struct App {
 
 impl App {
     fn new(repositories: Vec<Repository>) -> Self {
+        let filtered_indices: Vec<usize> = (0..repositories.len()).collect();
         let mut table_state = TableState::default();
         if !repositories.is_empty() {
             table_state.select(Some(0));
         }
         Self {
             repositories,
+            filtered_indices,
             table_state,
             mode: AppMode::Normal,
-            status_message: String::from("q: Quit | ↑↓: Navigate | d: Edit Description | t: Edit Topics | Enter: Save"),
+            status_message: String::from("q: Quit | /: Search | ↑↓: Navigate | d: Edit Description | t: Edit Topics"),
         }
     }
 
     fn next(&mut self) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
         let i = match self.table_state.selected() {
             Some(i) => {
-                if i >= self.repositories.len() - 1 {
+                if i >= self.filtered_indices.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -90,10 +99,13 @@ impl App {
     }
 
     fn previous(&mut self) {
+        if self.filtered_indices.is_empty() {
+            return;
+        }
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.repositories.len() - 1
+                    self.filtered_indices.len() - 1
                 } else {
                     i - 1
                 }
@@ -105,25 +117,32 @@ impl App {
 
     fn start_editing(&mut self, field: EditField) {
         if let Some(selected) = self.table_state.selected() {
-            let repo = &self.repositories[selected];
-            let content = match field {
-                EditField::Description => repo.description.clone().unwrap_or_default(),
-                EditField::Topics => repo.topics_as_string(),
-            };
-            self.mode = AppMode::Editing { field, content };
-            self.status_message = "Editing... | Enter: Save | Esc: Cancel".to_string();
+            if selected < self.filtered_indices.len() {
+                let repo_idx = self.filtered_indices[selected];
+                let repo = &self.repositories[repo_idx];
+                let content = match field {
+                    EditField::Description => repo.description.clone().unwrap_or_default(),
+                    EditField::Topics => repo.topics_as_string(),
+                };
+                self.mode = AppMode::Editing { field, content };
+                self.status_message = "Editing... | Enter: Save | Esc: Cancel".to_string();
+            }
         }
     }
 
     fn cancel_editing(&mut self) {
         self.mode = AppMode::Normal;
-        self.status_message = String::from("q: Quit | ↑↓: Navigate | d: Edit Description | t: Edit Topics | Enter: Save");
+        self.status_message = String::from("q: Quit | /: Search | ↑↓: Navigate | d: Edit Description | t: Edit Topics");
     }
 
     async fn save_edit(&mut self) -> Result<()> {
         if let AppMode::Editing { field, content } = &self.mode {
             if let Some(selected) = self.table_state.selected() {
-                let repo_name = self.repositories[selected].name.clone();
+                if selected >= self.filtered_indices.len() {
+                    return Ok(());
+                }
+                let repo_idx = self.filtered_indices[selected];
+                let repo_name = self.repositories[repo_idx].name.clone();
 
                 match field {
                     EditField::Description => {
@@ -134,7 +153,7 @@ impl App {
                             .output()?;
 
                         if output.status.success() {
-                            self.repositories[selected].description = Some(content.clone());
+                            self.repositories[repo_idx].description = Some(content.clone());
                             self.status_message = format!("✓ Description updated for {}", repo_name);
                         } else {
                             let error = String::from_utf8_lossy(&output.stderr);
@@ -164,7 +183,7 @@ impl App {
                         let output = cmd.output()?;
 
                         if output.status.success() {
-                            self.repositories[selected].repository_topics = Some(
+                            self.repositories[repo_idx].repository_topics = Some(
                                 topics.iter().map(|t| Topic { name: t.to_string() }).collect()
                             );
                             self.status_message = format!("✓ Topics updated for {}", repo_name);
@@ -188,6 +207,83 @@ impl App {
                 }
                 KeyCode::Backspace => {
                     content.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn start_searching(&mut self) {
+        self.mode = AppMode::Searching {
+            query: String::new(),
+        };
+        self.status_message = "Search (name/description/tags) | Enter: Apply | Esc: Cancel".to_string();
+    }
+
+    fn cancel_searching(&mut self) {
+        self.mode = AppMode::Normal;
+        // Reset filter to show all repositories
+        self.filtered_indices = (0..self.repositories.len()).collect();
+        self.table_state.select(Some(0));
+        self.status_message = String::from("q: Quit | /: Search | ↑↓: Navigate | d: Edit Description | t: Edit Topics");
+    }
+
+    fn apply_search(&mut self) {
+        if let AppMode::Searching { query } = &self.mode {
+            let query_lower = query.to_lowercase();
+
+            if query.is_empty() {
+                // Show all repositories if query is empty
+                self.filtered_indices = (0..self.repositories.len()).collect();
+            } else {
+                // Filter repositories based on query
+                self.filtered_indices = self.repositories
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, repo)| {
+                        // Search in repository name
+                        if repo.name.to_lowercase().contains(&query_lower) {
+                            return true;
+                        }
+                        // Search in description
+                        if let Some(desc) = &repo.description {
+                            if desc.to_lowercase().contains(&query_lower) {
+                                return true;
+                            }
+                        }
+                        // Search in topics/tags
+                        if let Some(topics) = &repo.repository_topics {
+                            for topic in topics {
+                                if topic.name.to_lowercase().contains(&query_lower) {
+                                    return true;
+                                }
+                            }
+                        }
+                        false
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect();
+            }
+
+            self.mode = AppMode::Normal;
+            if !self.filtered_indices.is_empty() {
+                self.table_state.select(Some(0));
+                self.status_message = format!("Found {} repositories | /: New Search | Esc: Clear", self.filtered_indices.len());
+            } else {
+                self.table_state.select(None);
+                self.status_message = "No repositories found | /: New Search | Esc: Clear".to_string();
+            }
+        }
+    }
+
+    fn handle_search_input(&mut self, key_code: KeyCode) {
+        if let AppMode::Searching { query } = &mut self.mode {
+            match key_code {
+                KeyCode::Char(c) => {
+                    query.push(c);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
                 }
                 _ => {}
             }
@@ -228,7 +324,9 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
-    let rows = app.repositories.iter().map(|repo| {
+    // Only show filtered repositories
+    let rows = app.filtered_indices.iter().map(|&idx| {
+        let repo = &app.repositories[idx];
         let cells = vec![
             Cell::from(repo.name.clone()),
             Cell::from(repo.description.clone().unwrap_or_default()),
@@ -237,12 +335,18 @@ fn render_table(f: &mut Frame, app: &mut App, area: Rect) {
         Row::new(cells).height(1)
     });
 
+    let title = if app.filtered_indices.len() == app.repositories.len() {
+        format!("Repositories ({})", app.repositories.len())
+    } else {
+        format!("Repositories ({}/{})", app.filtered_indices.len(), app.repositories.len())
+    };
+
     let table = Table::new(
         rows,
         [Constraint::Percentage(30), Constraint::Percentage(40), Constraint::Percentage(30)],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title("Repositories"))
+    .block(Block::default().borders(Borders::ALL).title(title))
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
@@ -265,6 +369,16 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 Line::from(vec![
                     Span::styled(format!("Editing {}: ", field_name), Style::default().fg(Color::Cyan)),
                     Span::raw(content),
+                ]),
+                Line::from(app.status_message.clone()),
+            ]
+        }
+        AppMode::Searching { query } => {
+            vec![
+                Line::from(vec![
+                    Span::styled("Search: ", Style::default().fg(Color::Green)),
+                    Span::raw(query),
+                    Span::styled("█", Style::default().fg(Color::Green)), // Cursor
                 ]),
                 Line::from(app.status_message.clone()),
             ]
@@ -330,6 +444,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                         KeyCode::Up | KeyCode::Char('k') => app.previous(),
                         KeyCode::Char('d') => app.start_editing(EditField::Description),
                         KeyCode::Char('t') => app.start_editing(EditField::Topics),
+                        KeyCode::Char('/') => app.start_searching(),
+                        KeyCode::Esc => app.cancel_searching(), // Clear search filter
                         _ => {}
                     },
                     AppMode::Editing { .. } => match key.code {
@@ -338,6 +454,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         KeyCode::Esc => app.cancel_editing(),
                         code => app.handle_edit_input(code),
+                    },
+                    AppMode::Searching { .. } => match key.code {
+                        KeyCode::Enter => app.apply_search(),
+                        KeyCode::Esc => app.cancel_searching(),
+                        code => app.handle_search_input(code),
                     },
                 }
             }
