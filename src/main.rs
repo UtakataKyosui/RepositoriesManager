@@ -217,7 +217,7 @@ impl App {
         self.mode = AppMode::Searching {
             query: String::new(),
         };
-        self.status_message = "Search (name/description/tags) | Enter: Apply | Esc: Cancel".to_string();
+        self.status_message = "Search (keywords or topics:tag1,tag2) | Enter: Apply | Esc: Cancel".to_string();
     }
 
     fn cancel_searching(&mut self) {
@@ -230,13 +230,37 @@ impl App {
 
     fn apply_search(&mut self) {
         if let AppMode::Searching { query } = &self.mode {
-            let query_lower = query.to_lowercase();
-
             if query.is_empty() {
                 // Show all repositories if query is empty
                 self.filtered_indices = (0..self.repositories.len()).collect();
+            } else if let Some(topics_query) = query.strip_prefix("topics:") {
+                // Topic-specific search: topics:rust,cli
+                let required_topics: Vec<String> = topics_query
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                self.filtered_indices = self.repositories
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, repo)| {
+                        if let Some(repo_topics) = &repo.repository_topics {
+                            // Check if repository has all required topics
+                            required_topics.iter().all(|required| {
+                                repo_topics.iter().any(|topic| {
+                                    topic.name.to_lowercase().contains(required)
+                                })
+                            })
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|(idx, _)| idx)
+                    .collect();
             } else {
-                // Filter repositories based on query
+                // General search across name, description, and topics
+                let query_lower = query.to_lowercase();
                 self.filtered_indices = self.repositories
                     .iter()
                     .enumerate()
